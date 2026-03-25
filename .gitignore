@@ -1,0 +1,39 @@
+# Python environments
+.venv/
+venv/
+env/
+
+# Python caches/build artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Notebook caches
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# ML artifacts and checkpoints
+runs/
+checkpoints/
+wandb/
+MBRA/
+
+# Local large dataset/video artifacts
+episode_videos/
+alignment_debug/
+file-000.mp4
+
+# Editor/project metadata
+.vscode/
+.idea/
