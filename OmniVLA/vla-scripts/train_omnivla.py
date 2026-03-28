@@ -7,8 +7,8 @@ Train or finetune OmniVLA with LoRA.
 # ==============================
 # Configuration Flags
 # ==============================
-TRAIN_MODE = False   # True: training mode, False: debug mode (minimize GPU RAM usage)
-VISUALIZE = True    # True: save visualization images of policy performance
+TRAIN_MODE = True    # True: training mode, False: debug mode (minimize GPU RAM usage)
+VISUALIZE = False    # True: save visualization images of policy performance
 
 # ==============================
 # Path Setup
@@ -98,11 +98,8 @@ from prismatic.util.data_utils import PaddedCollatorForActionPrediction_Nav_MMN
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK, POSE_DIM, IGNORE_INDEX
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
-from prismatic.vla.datasets.dummy_dataset import Dummy_Dataset
 from prismatic.vla.datasets.lekiwi_dataset import Lekiwi_Dataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
-
-from vint_train.models.exaug.exaug import ExAug_dist_delay
 
 # ==============================
 # Transform Definition
@@ -131,12 +128,12 @@ class OmniVLAConfig:
 
     # Training configuration
     batch_size: int = 1                              # Batch size per device (total batch size = batch_size * num GPUs)
-    learning_rate: float = 1e-4                      # Learning rate
+    learning_rate: float = 5e-5                      # Learning rate (conservative first-run default)
     lr_warmup_steps: int = 0                         # Number of steps to warm up learning rate (from 10% to 100%)
-    num_steps_before_decay: int = 100_000            # Number of steps before LR decays by 10x
+    num_steps_before_decay: int = 5_000              # Number of steps before LR decays by 10x
     grad_accumulation_steps: int = 1                # Number of gradient accumulation steps
-    max_steps: int = 200_000                         # Max number of training steps
-    save_freq: int = 1000                          # Checkpoint saving frequency in steps    
+    max_steps: int = 10_000                          # Max number of training steps
+    save_freq: int = 500                             # Checkpoint saving frequency in steps
     save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
                                                      #   (If False, saves all checkpoints)
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
@@ -149,8 +146,8 @@ class OmniVLAConfig:
                                                      #   Note: Merging can be very slow on some machines. If so, set to
                                                      #         False and merge final checkpoint offline!
     # Logging
-    wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
-    wandb_project: str = "your-wandb-project"        # Name of WandB project
+    wandb_entity: str = "jx6-princeton-university"          # Name of WandB entity
+    wandb_project: str = "omnivla-finetuning"        # Name of WandB project
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
@@ -319,25 +316,36 @@ def run_forward_pass(
     #batch size
     Bsize = batch["cur_image"].size()[0]
     
-    # Get ground-truth action labels    
+    # Get ground-truth action labels
     ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
     modality_id = batch["goal_mask_select"]
+    action_select_mask = batch["action_select_mask"].to(torch.bfloat16).to(device_id)
         
-    #MBRA action reannotation
-    img_goal = transform(batch["goal_image_8"])
-    img_hist = torch.split(batch["cur_image"], 3, dim=1)
-    img_hist_norm_list = [transform(obs_image) for obs_image in img_hist]
-    img_hist_norm = torch.concat(img_hist_norm_list, dim=1)      
+    # MBRA reannotation is only needed for samples where action_select_mask == 0.
+    requires_mbra = torch.any(action_select_mask < 0.5).item()
+    if requires_mbra:
+        if mbra is None:
+            raise RuntimeError(
+                "MBRA is required when action_select_mask contains zeros, "
+                "but MBRA was not initialized."
+            )
 
-    rsize = 0.3*torch.ones(Bsize, 1, 1).to(device_id)
-    delay = torch.zeros(Bsize, 1, 1).to(device_id)
-    linear_vel_old = 0.5*torch.ones(Bsize, 6).float().to(device_id)
-    angular_vel_old = 0.0*torch.ones(Bsize, 6).float().to(device_id)
-    vel_past = torch.cat((linear_vel_old, angular_vel_old), axis=1).unsqueeze(2)          
-                
-    with torch.no_grad():
-        linear_vel, angular_vel, _ = mbra(img_hist_norm, img_goal, rsize, delay, vel_past)  
-    action_mbra = robot_pos_model(linear_vel, angular_vel)  
+        img_goal = transform(batch["goal_image_8"])
+        img_hist = torch.split(batch["cur_image"], 3, dim=1)
+        img_hist_norm_list = [transform(obs_image) for obs_image in img_hist]
+        img_hist_norm = torch.concat(img_hist_norm_list, dim=1)
+
+        rsize = 0.3 * torch.ones(Bsize, 1, 1).to(device_id)
+        delay = torch.zeros(Bsize, 1, 1).to(device_id)
+        linear_vel_old = 0.5 * torch.ones(Bsize, 6).float().to(device_id)
+        angular_vel_old = 0.0 * torch.ones(Bsize, 6).float().to(device_id)
+        vel_past = torch.cat((linear_vel_old, angular_vel_old), axis=1).unsqueeze(2)
+
+        with torch.no_grad():
+            linear_vel, angular_vel, _ = mbra(img_hist_norm, img_goal, rsize, delay, vel_past)
+        action_mbra = robot_pos_model(linear_vel, angular_vel)
+    else:
+        action_mbra = ground_truth_actions
     
     # OmniVLA forward pass    
     if TRAIN_MODE:
@@ -399,22 +407,31 @@ def run_forward_pass(
                 predicted_actions = action_head.module.predict_action(actions_hidden_states, modality_id.to(torch.bfloat16).to(device_id))
                                             
         # Setting supervised action command by raw action or systhetic MBRA action
-        mask_act = batch["action_select_mask"].to(torch.bfloat16).to(device_id).unsqueeze(1).unsqueeze(2).repeat(1,8,4)
+        mask_act = action_select_mask.unsqueeze(1).unsqueeze(2).repeat(1,8,4)
         mask_notact = -1.0*(mask_act - 1.0)           
         action_ref = mask_act*ground_truth_actions + mask_notact*action_mbra.detach().to(torch.bfloat16)
 
-        limited_temp_dist = torch.clip(batch["temp_dist"], min=0.0, max=20.0) 
-        lan_bool = (batch["goal_mask_select"] == 7)|(batch["goal_mask_select"] == 8) #object loss is only for the LeLaN dataset
-        loss = 1.0*torch.nn.MSELoss()(action_ref, predicted_actions) + 0.1*torch.nn.MSELoss()(obj_pose_norm[lan_bool], predicted_actions[:,-1,0:2][lan_bool]) + 0.1*torch.nn.MSELoss()(predicted_actions[:,0:-1], predicted_actions[:,1:])            
+        limited_temp_dist = torch.clip(batch["temp_dist"], min=0.0, max=20.0)
+        lan_bool = (batch["goal_mask_select"] == 7) | (batch["goal_mask_select"] == 8)  # object loss is only for the LeLaN dataset
+
         L2_action = torch.nn.MSELoss()(action_ref, predicted_actions)
-        L2_obj = torch.nn.MSELoss()(obj_pose_norm[lan_bool], predicted_actions[:,-1,0:2][lan_bool])
-        L2_smooth = torch.nn.MSELoss()(predicted_actions[:,0:-1], predicted_actions[:,1:])
+        if torch.any(lan_bool):
+            L2_obj = torch.nn.MSELoss()(obj_pose_norm[lan_bool], predicted_actions[:, -1, 0:2][lan_bool])
+        else:
+            # No language modalities in the current batch (e.g., modality-6-only training).
+            L2_obj = torch.zeros((), device=predicted_actions.device, dtype=predicted_actions.dtype)
+        L2_smooth = torch.nn.MSELoss()(predicted_actions[:, 0:-1], predicted_actions[:, 1:])
+
+        loss = 1.0 * L2_action + 0.1 * L2_obj + 0.1 * L2_smooth
             
         loss_list = []
         task_list = []
         for icl in range(9):
             mask_task = batch["goal_mask_select"] == icl
-            L2_action_task = torch.nn.MSELoss()(action_ref[mask_task], predicted_actions[mask_task])
+            if torch.any(mask_task):
+                L2_action_task = torch.nn.MSELoss()(action_ref[mask_task], predicted_actions[mask_task])
+            else:
+                L2_action_task = torch.tensor(float("nan"), device=predicted_actions.device)
             loss_list.append(L2_action_task)
             task_list.append(torch.sum(mask_task.float()))
 
@@ -733,6 +750,19 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
     elif cfg.vla_path == "./omnivla-finetuned-cast": #from OmniVLA checkpoints fituned with CAST dataset 
         cfg.resume = True      
         cfg.resume_step = 210000 
+
+    # If the user passed a local path (e.g. ./omnivla-original), validate early
+    # to avoid cryptic Hugging Face repo-id validation errors.
+    if cfg.vla_path.startswith(("./", "../", "/", "~")):
+        local_vla_path = Path(cfg.vla_path).expanduser().resolve()
+        if not local_vla_path.exists():
+            raise FileNotFoundError(
+                f"Local --vla_path was not found: {local_vla_path}\n"
+                "Download/checkpoint it first, e.g. from README:\n"
+                "  git clone https://huggingface.co/NHirose/omnivla-original\n"
+                "or pass a valid Hub model id such as: openvla/openvla-7b"
+            )
+        cfg.vla_path = str(local_vla_path)
                                                                                           
     # Get experiment run ID
     run_id = get_run_id(cfg)
@@ -754,26 +784,39 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
     if distributed_state.is_main_process:
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
     
-    #defining and loading MBRA
+    # Load MBRA config (context size etc.).
     with open("./config_nav/mbra_config.yaml", "r") as f:        
-        config = yaml.safe_load(f)      
-    mbra = ExAug_dist_delay(
-        context_size=config["context_size"],
-        len_traj_pred=config["len_traj_pred"],
-        learn_angle=config["learn_angle"],
-        obs_encoder=config["obs_encoder"],
-        obs_encoding_size=config["obs_encoding_size"],
-        late_fusion=config["late_fusion"],
-        mha_num_attention_heads=config["mha_num_attention_heads"],
-        mha_num_attention_layers=config["mha_num_attention_layers"],
-        mha_ff_dim_factor=config["mha_ff_dim_factor"],
-    )     
-    checkpoint_path_mbra = os.path.join("./MBRA", "mbra.pth")
-    print("Loading MBRA model from ", checkpoint_path_mbra)
-    latest_checkpoint_mbra = torch.load(checkpoint_path_mbra, map_location="cpu")
-    mbra.load_state_dict(latest_checkpoint_mbra, strict=False) 
-    mbra.eval().to(device=device_id)
-    mbra = wrap_ddp(mbra, device_id, find_unused=True)
+        config = yaml.safe_load(f)
+
+    use_mbra = cfg.dataset_name.lower() != "lekiwi"
+    mbra = None
+    if use_mbra:
+        try:
+            from vint_train.models.exaug.exaug import ExAug_dist_delay
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "Missing MBRA dependency 'vint_train'. Install MBRA deps or run with --dataset_name lekiwi."
+            ) from exc
+
+        mbra = ExAug_dist_delay(
+            context_size=config["context_size"],
+            len_traj_pred=config["len_traj_pred"],
+            learn_angle=config["learn_angle"],
+            obs_encoder=config["obs_encoder"],
+            obs_encoding_size=config["obs_encoding_size"],
+            late_fusion=config["late_fusion"],
+            mha_num_attention_heads=config["mha_num_attention_heads"],
+            mha_num_attention_layers=config["mha_num_attention_layers"],
+            mha_ff_dim_factor=config["mha_ff_dim_factor"],
+        )
+        checkpoint_path_mbra = os.path.join("./MBRA", "mbra.pth")
+        print("Loading MBRA model from ", checkpoint_path_mbra)
+        latest_checkpoint_mbra = torch.load(checkpoint_path_mbra, map_location="cpu")
+        mbra.load_state_dict(latest_checkpoint_mbra, strict=False)
+        mbra.eval().to(device=device_id)
+        mbra = wrap_ddp(mbra, device_id, find_unused=True)
+    else:
+        print("Skipping MBRA initialization for lekiwi dataset (action_select_mask uses dataset actions).")
 
     # Print detected constants
     print(
@@ -948,6 +991,7 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
             )
         else:
             #dummy dataset
+            from prismatic.vla.datasets.dummy_dataset import Dummy_Dataset
             dataset_dummy = Dummy_Dataset(   
                 context_size = config["context_size"],             
                 action_tokenizer=action_tokenizer,
@@ -1056,7 +1100,10 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
                         
                 # Backward pass
                 if TRAIN_MODE:
-                    normalized_loss.backward()
+                    if torch.isfinite(normalized_loss):
+                        normalized_loss.backward()
+                    else:
+                        print(f"Warning: non-finite loss at batch_idx={batch_idx}, step={log_step}; skipping backward.")
 
                 # Store recent train metrics
                 for metric_name, value in metrics.items():

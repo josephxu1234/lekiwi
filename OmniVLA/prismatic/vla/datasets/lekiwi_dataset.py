@@ -1,8 +1,9 @@
 import csv
-import math
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type
 
 import numpy as np
 import torch
@@ -15,6 +16,7 @@ from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.constants import IGNORE_INDEX, NUM_ACTIONS_CHUNK
+import cv2
 
 
 @dataclass
@@ -42,6 +44,7 @@ class Lekiwi_Dataset(Dataset):
     ):
         self.csv_path = Path(csv_path)
         self.video_path = Path(video_path)
+        self._source_video_path = self.video_path
         self.context_size = context_size
         self.action_tokenizer = action_tokenizer
         self.base_tokenizer = base_tokenizer
@@ -55,6 +58,7 @@ class Lekiwi_Dataset(Dataset):
         self.episodes = self._load_episodes()
         self.sample_index = self._build_sample_index()
         self._video_capture = None
+        self._prepare_video_for_decoding()
 
         if len(self.sample_index) == 0:
             raise ValueError("No valid lekiwi samples found. Check CSV/video alignment and action horizon.")
@@ -146,10 +150,99 @@ class Lekiwi_Dataset(Dataset):
                 sample_index.append((eidx, local_t))
         return sample_index
 
+    def _get_video_codec(self, video_path: Path) -> Optional[str]:
+        ffprobe = shutil.which("ffprobe")
+        if ffprobe is None:
+            return None
+
+        cmd = [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ]
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError:
+            return None
+
+        codec = result.stdout.strip().lower()
+        return codec or None
+
+    def _can_decode_first_frame(self, video_path: Path) -> bool:
+
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            cap.release()
+            return False
+
+        ok, frame = cap.read()
+        cap.release()
+        return bool(ok and frame is not None)
+
+    def _transcode_to_h264(self, input_path: Path, output_path: Path) -> None:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError(
+                "OpenCV could not decode the input video."
+            )
+
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-v",
+            "warning",
+            "-i",
+            str(input_path),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "18",
+            "-preset",
+            "fast",
+            str(output_path),
+        ]
+
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"Failed to transcode video for OpenCV decode: {input_path}") from exc
+
+    def _prepare_video_for_decoding(self) -> None:
+        if not self.video_path.exists():
+            raise FileNotFoundError(f"Video file not found: {self.video_path}")
+
+        codec = self._get_video_codec(self.video_path)
+        fallback_video_path = self.video_path.with_name(f"{self.video_path.stem}_h264{self.video_path.suffix}")
+
+        if codec == "av1":
+            print(
+                f"using H.264 fallback for OpenCV compatibility: {fallback_video_path}"
+            )
+            if not fallback_video_path.exists() or not self._can_decode_first_frame(fallback_video_path):
+                self._transcode_to_h264(self.video_path, fallback_video_path)
+            self.video_path = fallback_video_path
+            return
+
+        if not self._can_decode_first_frame(self.video_path):
+            print(
+                f"using H.264 fallback for OpenCV compatibility: {fallback_video_path}"
+            )
+            if not fallback_video_path.exists() or not self._can_decode_first_frame(fallback_video_path):
+                self._transcode_to_h264(self.video_path, fallback_video_path)
+            self.video_path = fallback_video_path
+
     def _get_video_capture(self):
         if self._video_capture is None:
-            import cv2
-
             cap = cv2.VideoCapture(str(self.video_path))
             if not cap.isOpened():
                 raise RuntimeError(f"Failed to open video: {self.video_path}")
@@ -157,8 +250,6 @@ class Lekiwi_Dataset(Dataset):
         return self._video_capture
 
     def _read_frame_rgb(self, global_frame_idx: int) -> Image.Image:
-        import cv2
-
         cap = self._get_video_capture()
         cap.set(cv2.CAP_PROP_POS_FRAMES, float(global_frame_idx))
         ok, frame_bgr = cap.read()
@@ -211,7 +302,6 @@ class Lekiwi_Dataset(Dataset):
         pixel_values_current = self.image_transform(current_image_pil)
         pixel_values_goal = self.image_transform(goal_image_pil)
 
-        # MBRA expects a short history stack at 96x96 with shape (3*(context_size+1), H, W).
         context_frames = []
         for k in range(self.context_size + 1):
             local_hist = max(0, local_t - (self.context_size - k))

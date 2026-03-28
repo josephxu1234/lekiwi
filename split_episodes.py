@@ -1,13 +1,88 @@
 from pathlib import Path
+import shutil
+import subprocess
 
 import cv2
 import pandas as pd
 
 
+def _get_video_codec(video_path: Path) -> str | None:
+    ffprobe = shutil.which('ffprobe')
+    if ffprobe is None:
+        return None
+
+    cmd = [
+        ffprobe,
+        '-v',
+        'error',
+        '-select_streams',
+        'v:0',
+        '-show_entries',
+        'stream=codec_name',
+        '-of',
+        'default=noprint_wrappers=1:nokey=1',
+        str(video_path),
+    ]
+
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        return None
+
+    codec = result.stdout.strip().lower()
+    return codec or None
+
+
+def _can_decode_first_frame(video_path: Path) -> bool:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        cap.release()
+        return False
+
+    ok, frame = cap.read()
+    cap.release()
+    return bool(ok and frame is not None)
+
+
+def _transcode_to_h264(input_path: Path, output_path: Path) -> None:
+    ffmpeg = shutil.which('ffmpeg')
+    if ffmpeg is None:
+        raise RuntimeError(
+            'OpenCV failed to decode the input video.'
+        )
+
+    cmd = [
+        ffmpeg,
+        '-y',
+        '-v',
+        'warning',
+        '-i',
+        str(input_path),
+        '-an',
+        '-c:v',
+        'libx264',
+        '-pix_fmt',
+        'yuv420p',
+        '-crf',
+        '18',
+        '-preset',
+        'fast',
+        str(output_path),
+    ]
+
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f'Failed to transcode {input_path} to H.264 using ffmpeg.'
+        ) from exc
+
+
 def main() -> None:
-    workspace = Path('/Users/josephxu/Desktop/lekiwi')
+    workspace = Path('/scratch/gpfs/TSILVER/jx6/lekiwi')
     csv_path = workspace / 'lekiwi_green_block.csv'
     video_path = workspace / 'file-000.mp4'
+    fallback_video_path = workspace / 'file-000_h264.mp4'
     out_dir = workspace / 'episode_videos'
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -31,9 +106,26 @@ def main() -> None:
         if not contiguous:
             raise RuntimeError(f'Episode {ep}: frame_index is not contiguous.')
 
-    cap = cv2.VideoCapture(str(video_path))
+    active_video_path = video_path
+    codec = _get_video_codec(video_path)
+    if codec == 'av1':
+        print(
+            f'Transcoding to H.264: {fallback_video_path}'
+        )
+        if not fallback_video_path.exists() or not _can_decode_first_frame(fallback_video_path):
+            _transcode_to_h264(video_path, fallback_video_path)
+        active_video_path = fallback_video_path
+    elif not _can_decode_first_frame(video_path):
+        print(
+            f'Transcoding to H.264: {fallback_video_path}'
+        )
+        if not fallback_video_path.exists() or not _can_decode_first_frame(fallback_video_path):
+            _transcode_to_h264(video_path, fallback_video_path)
+        active_video_path = fallback_video_path
+
+    cap = cv2.VideoCapture(str(active_video_path))
     if not cap.isOpened():
-        raise RuntimeError(f'Could not open video: {video_path}')
+        raise RuntimeError(f'Could not open video: {active_video_path}')
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -77,6 +169,7 @@ def main() -> None:
 
     cap.release()
 
+    print(f'Input video used: {active_video_path}')
     print(f'Output directory: {out_dir}')
     print(f'Episodes written: {len(outputs)}')
     print('First 5 outputs:')
